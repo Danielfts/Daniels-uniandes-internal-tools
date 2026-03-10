@@ -25,11 +25,45 @@ import re
 import time
 import threading
 import subprocess
+import csv
+from pathlib import Path
 import cv2
 import numpy as np
 import pytesseract
 
 DEBUG = "--debug" in sys.argv
+
+# ── Student data ──────────────────────────────────────────────────────
+
+STUDENT_DATA_PATH = Path(__file__).parent / "Data" / "student-data.csv"
+STUDENT_DISPLAY_SECS = 5   # seconds to keep student panel on screen
+STUDENT_PANEL_H = 95       # pixel height of student info panel
+DEBOUNCE_HITS = 2          # consecutive OCR scans required to confirm a code
+OCR_TARGET_H = 600         # resize crop to this height before Tesseract
+REPRINT_COOLDOWN = 4.0     # seconds card must be absent before re-printing
+
+
+def load_student_data(path: Path) -> dict:
+    """Load CSV → {student_id_str: {apellidos, nombres, programa, email}}."""
+    students: dict = {}
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                sid = row["ID de alumno"].strip()
+                students[sid] = {
+                    "apellidos": row["Apellidos"].strip(),
+                    "nombres":   row["Nombres"].strip(),
+                    "programa":  row["Programa"].strip(),
+                    "email":     row["Email"].strip(),
+                }
+        print(f"  Loaded {len(students)} students from {path.name}")
+    except FileNotFoundError:
+        print(f"  Warning: student data file not found at {path}")
+    return students
+
+
+STUDENTS: dict = load_student_data(STUDENT_DATA_PATH)
 
 # ── Display ───────────────────────────────────────────────────────────
 
@@ -118,6 +152,16 @@ def ocr_crop(crop: np.ndarray) -> list[dict]:
     """
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
+    # Resize to a fixed height: speeds up Tesseract without losing digit quality
+    h_orig = gray.shape[0]
+    if h_orig != OCR_TARGET_H:
+        ocr_scale = OCR_TARGET_H / h_orig
+        interp = cv2.INTER_AREA if ocr_scale < 1.0 else cv2.INTER_CUBIC
+        gray = cv2.resize(gray, (0, 0), fx=ocr_scale, fy=ocr_scale,
+                          interpolation=interp)
+    else:
+        ocr_scale = 1.0
+
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
 
@@ -161,10 +205,10 @@ def ocr_crop(crop: np.ndarray) -> list[dict]:
             seen.add(key)
             all_words.append({
                 "text": txt,
-                "x": data["left"][i],
-                "y": data["top"][i],
-                "w": data["width"][i],
-                "h": data["height"][i],
+                "x": int(data["left"][i]  / ocr_scale),
+                "y": int(data["top"][i]   / ocr_scale),
+                "w": int(data["width"][i] / ocr_scale),
+                "h": int(data["height"][i]/ ocr_scale),
                 "conf": conf,
             })
 
@@ -175,6 +219,22 @@ def ocr_crop(crop: np.ndarray) -> list[dict]:
             break
 
     return all_words
+
+def find_best_student_match(code_val: str) -> tuple[str, dict] | None:
+    """Exact lookup first; then accept the closest known code within 2 digit
+    substitutions (handles common OCR confusions like 1↔7, 0↔9, etc.)."""
+    if code_val in STUDENTS:
+        return code_val, STUDENTS[code_val]
+    if not (len(code_val) == 9 and code_val.startswith("202")):
+        return None
+    best_dist, best_code = 3, None
+    for sid in STUDENTS:
+        if len(sid) == 9:
+            d = sum(a != b for a, b in zip(sid, code_val))
+            if d < best_dist:
+                best_dist, best_code = d, sid
+    return (best_code, STUDENTS[best_code]) if best_code else None
+
 
 # ── Field extraction (student code only) ──────────────────────────────
 
@@ -312,6 +372,33 @@ def draw_debug_words(frame: np.ndarray, words: list[dict],
     return frame
 
 
+def draw_student_panel(frame: np.ndarray, student: dict, code: str) -> np.ndarray:
+    """Draw a semi-transparent student info panel just above the bottom HUD bar."""
+    h, w = frame.shape[:2]
+    hud_bot = 38
+    py1 = h - hud_bot - STUDENT_PANEL_H
+    py2 = h - hud_bot
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, py1), (w, py2), (15, 15, 15), -1)
+    frame = cv2.addWeighted(overlay, 0.82, frame, 0.18, 0)
+
+    # Green accent bar on the left
+    cv2.rectangle(frame, (0, py1), (6, py2), GREEN, -1)
+
+    name = f"{student['nombres']}  {student['apellidos']}"
+    cv2.putText(frame, name, (18, py1 + 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.78, GREEN, 2)
+    cv2.putText(frame, f"Codigo: {code}", (18, py1 + 52),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.58, WHITE, 1)
+    cv2.putText(frame, student["programa"], (18, py1 + 72),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52, GREY, 1)
+    cv2.putText(frame, student["email"], (18, py1 + 90),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.47, DIM_GREY, 1)
+
+    return frame
+
+
 def draw_hud(frame: np.ndarray, code: dict | None, status: str,
              fps: float, ocr_fps: float) -> np.ndarray:
     """HUD: top bar, bottom status, code display."""
@@ -345,7 +432,7 @@ def draw_hud(frame: np.ndarray, code: dict | None, status: str,
 class OCRScanner:
     """Runs Tesseract on cropped frames in a background thread."""
 
-    def __init__(self):
+    def __init__(self, known_codes: frozenset[str] = frozenset()):
         self._lock = threading.Lock()
         self._crop: np.ndarray | None = None
         self._words: list[dict] = []
@@ -353,6 +440,9 @@ class OCRScanner:
         self._running = True
         self._ocr_fps = 0.0
         self._force = threading.Event()
+        self._known_codes = known_codes
+        self._candidate_val: str | None = None
+        self._candidate_hits: int = 0
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -362,6 +452,18 @@ class OCRScanner:
 
     def force_scan(self):
         self._force.set()
+
+    def _normalize_code(self, val: str) -> str:
+        """Fuzzy-correct val to the nearest known code (Hamming ≤ 2)."""
+        if not self._known_codes or val in self._known_codes:
+            return val
+        best_dist, best = 3, None
+        for k in self._known_codes:
+            if len(k) == len(val) == 9:
+                d = sum(a != b for a, b in zip(k, val))
+                if d < best_dist:
+                    best_dist, best = d, k
+        return best if best else val
 
     @property
     def words(self) -> list[dict]:
@@ -398,11 +500,29 @@ class OCRScanner:
                 continue
 
             words = ocr_crop(crop)
-            code = extract_code(words)
+            raw = extract_code(words)
+
+            # Normalise (fuzzy) and debounce across consecutive OCR scans
+            if raw:
+                nval = self._normalize_code(raw["value"])
+                if nval == self._candidate_val:
+                    self._candidate_hits += 1
+                else:
+                    self._candidate_val = nval
+                    self._candidate_hits = 1
+                confirmed = (
+                    {**raw, "value": nval}
+                    if self._candidate_hits >= DEBOUNCE_HITS
+                    else None
+                )
+            else:
+                self._candidate_val = None
+                self._candidate_hits = 0
+                confirmed = None
 
             with self._lock:
                 self._words = words
-                self._code = code
+                self._code = confirmed
 
             count += 1
             elapsed = time.time() - timer
@@ -430,7 +550,17 @@ def process_image(path: str) -> None:
     code = extract_code(words)
 
     val = code["value"] if code else "(no detectado)"
-    print(f"\n  Codigo: {val}\n")
+    match = find_best_student_match(val) if code else None
+    if match and match[0] != val:
+        print(f"\n  Codigo  : {match[0]}  (OCR read {val}, fuzzy-corrected)")
+    else:
+        print(f"\n  Codigo  : {val}")
+    if match:
+        s = match[1]
+        print(f"  Nombre  : {s['nombres']} {s['apellidos']}")
+        print(f"  Programa: {s['programa']}")
+        print(f"  Email   : {s['email']}")
+    print()
 
     display = img.copy()
     if DEBUG:
@@ -482,10 +612,16 @@ def camera_loop() -> None:
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win_name, disp_w, disp_h)
 
-    scanner = OCRScanner()
+    scanner = OCRScanner(frozenset(STUDENTS))
     status = "Centre the ID card inside the box"
     show_debug = DEBUG
     last_code_value = ""
+
+    current_student: dict | None = None
+    current_student_code: str = ""
+    student_show_time: float = 0.0
+    last_printed_code: str = ""
+    code_absent_since: float = 0.0
 
     fps = 0.0
     frame_count = 0
@@ -528,8 +664,31 @@ def camera_loop() -> None:
             display = draw_code_box(display, mirrored_code, gx1, gy1)
             last_code_value = code["value"]
             status = f"Found: {code['value']}"
+            code_absent_since = 0.0  # card is present — reset absence timer
+
+            # Student lookup (value already normalised by OCRScanner)
+            match = find_best_student_match(code["value"])
+            if match and match[0] != last_printed_code:
+                matched_code, s = match
+                current_student = s
+                current_student_code = matched_code
+                student_show_time = time.time()
+                last_printed_code = matched_code
+                print()
+                print("  ┌─ STUDENT DETECTED ──────────────────────────────────")
+                print(f"  │  Codigo  : {matched_code}")
+                print(f"  │  Nombre  : {s['nombres']} {s['apellidos']}")
+                print(f"  │  Programa: {s['programa']}")
+                print(f"  │  Email   : {s['email']}")
+                print("  └────────────────────────────────────────────────────")
+                print()
         else:
             status = "Scanning... centre ID card in the box"
+            # Only allow re-scan of the same card after a meaningful absence gap
+            if code_absent_since == 0.0:
+                code_absent_since = time.time()
+            elif time.time() - code_absent_since > REPRINT_COOLDOWN:
+                last_printed_code = ""
 
         # FPS
         frame_count += 1
@@ -540,6 +699,8 @@ def camera_loop() -> None:
             fps_timer = time.time()
 
         display = draw_hud(display, code, status, fps, ocr_fps)
+        if current_student and (time.time() - student_show_time < STUDENT_DISPLAY_SECS):
+            display = draw_student_panel(display, current_student, current_student_code)
         cv2.imshow(win_name, display)
 
         key = cv2.waitKey(1) & 0xFF
